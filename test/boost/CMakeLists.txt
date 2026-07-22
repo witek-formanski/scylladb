@@ -71,6 +71,8 @@ add_scylla_test(config_test
   KIND SEASTAR)
 add_scylla_test(object_storage_config_test
   KIND SEASTAR)
+add_scylla_test(posix_object_storage_client_test
+  KIND SEASTAR)
 add_scylla_test(continuous_data_consumer_test
   KIND SEASTAR)
 add_scylla_test(counter_test
