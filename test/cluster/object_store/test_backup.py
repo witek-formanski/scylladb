@@ -18,7 +18,7 @@ from typing import Callable, Awaitable
 from functools import partial
 from test.pylib.manager_client import ManagerClient, ServerInfo
 from test.cluster.util import wait_for_cql_and_get_hosts, get_replication, new_test_keyspace, new_test_table, reconnect_driver
-from test.pylib.object_storage import keyspace_options
+from test.pylib.object_storage import keyspace_options, format_tuples
 from test.pylib.rest_client import read_barrier, HTTPError
 from test.pylib.util import unique_name, wait_all
 from test.pylib.tablets import get_tablet_replica, get_all_tablet_replicas
@@ -1983,3 +1983,152 @@ async def test_restore_tablets_dropping_destination_keeps_backup(build_mode: str
     left_over = {key for key in objects_after_drop if key.split('/')[0] == 'sstables' and key.split('/')[1] in restored_sids}
     assert not left_over, f'Objects of the dropped restored keyspace were not removed: {sorted(left_over)}'
 
+
+@pytest.mark.parametrize("destination", ['local', 'object_storage'])
+async def test_restore_tablets_from_cluster_backup(build_mode: str, manager: ManagerClient, object_storage, destination):
+    '''Restore from a cluster backup, whose layout differs from the
+    /storage_service/backup one: the component files are stored under
+    {root}/sstables/{sstable_id}/ and the manifest under
+    {root}/snapshots/{name}/, with the root anywhere in the bucket.'''
+
+    # Two nodes because system_distributed uses SimpleStrategy with a replication
+    # factor of 3, so a single node cannot satisfy the QUORUM consistency levels
+    # of the backup and restore bookkeeping.
+    # One node per rack, because cluster backup reads the sstables of a node with
+    # a query scoped to its rack, so with more than one node per rack the first
+    # node processed claims the token ranges of the others and their sstables end
+    # up in the manifest without being uploaded.
+    topology = topo(rf = 1, nodes = 2, racks = 2, dcs = 1)
+    servers, host_ids = await create_cluster(topology, manager, logger, object_storage)
+    cql = manager.get_cql()
+
+    num_keys = 10
+    cf = 'test'
+    prefix = 'nested/backup-root'
+
+    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {topology.rf}}}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} ( pk text primary key, value int ) WITH tablets = {{'min_tablet_count': 4}};")
+        await insert_keys(cql, ks, cf, num_keys)
+        await asyncio.gather(*(manager.api.flush_keyspace(s.ip_addr, ks) for s in servers))
+
+        snap_name = unique_name('backup_')
+        tid = await manager.api.backup_cluster_snapshot(servers[0].ip_addr, ks, snap_name, servers[0].datacenter,
+                                                        object_storage.address, object_storage.bucket_name, prefix, tables=[cf])
+        status = await manager.api.wait_task(servers[0].ip_addr, tid)
+        assert (status is not None) and (status['state'] == 'done'), f'Cluster backup failed: {status}'
+
+    if destination == 'object_storage':
+        opts = keyspace_options(object_storage, rf=topology.rf)
+    else:
+        opts = f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {topology.rf}}}"
+    async with new_test_keyspace(manager, opts) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} ( pk text primary key, value int );")
+
+        manifests = [f'{prefix}/snapshots/{snap_name}/manifest.json']
+        tid = await manager.api.restore_tablets(servers[0].ip_addr, ks, cf, snap_name, servers[0].datacenter,
+                                                object_storage.address, object_storage.bucket_name, manifests)
+        status = await manager.api.wait_task(servers[0].ip_addr, tid)
+        assert (status is not None) and (status['state'] == 'done'), f'Restore failed: {status}'
+        assert status['progress_total'] > 0
+        assert status['progress_completed'] == status['progress_total']
+
+        await check_mutation_replicas(cql, manager, servers, range(num_keys), topology, logger, ks, cf)
+
+
+async def back_up_cluster_snapshot(manager: ManagerClient, object_storage, servers, ks, cf, prefix):
+    '''Flushes and repairs ks.cf, backs it up under prefix and returns the
+    snapshot name together with the parsed manifest. The repair is what makes
+    cluster backup deduplicate: it only drops the copies of a token range once
+    the range is repaired.'''
+    snap_name = unique_name('backup_')
+    await asyncio.gather(*(manager.api.flush_keyspace(s.ip_addr, ks) for s in servers))
+    await manager.api.repair(servers[0].ip_addr, ks, cf)
+    manifest = await run_cluster_backup(object_storage, prefix, manager, snap_name, ks, cf, servers)
+    return snap_name, manifest
+
+
+def assert_manifest_is_deduplicated(manifest):
+    '''Cluster backup backs up the sstables of a single node for every token
+    range which is replicated. Restore has to cope with that, so a test which
+    exercises it must first confirm that the backup really is deduplicated.'''
+    nodes_per_tablet = defaultdict(set)
+    for sst in manifest['sstables']:
+        nodes_per_tablet[sst['tablet_id']].add(sst['node'])
+    assert nodes_per_tablet, 'Cluster backup manifest describes no sstable'
+    for tablet_id, nodes in nodes_per_tablet.items():
+        assert len(nodes) <= 1, f'tablet {tablet_id} was backed up from more than one node: {nodes}'
+
+
+async def test_restore_tablets_from_cluster_backup_multi_rack(build_mode: str, manager: ManagerClient, object_storage):
+    '''Restore a cluster backup into a keyspace whose replicas are placed in
+    more than one rack. The backup describes the sstables of a single node per
+    token range, so a restore which looked the rows up under the rack they were
+    backed up from would leave every other replica empty while still reporting
+    success. check_mutation_replicas() asserts that every key ends up on as many
+    nodes as the replication factor.'''
+
+    topology = topo(rf = 2, nodes = 2, racks = 2, dcs = 1)
+    servers, host_ids = await create_cluster(topology, manager, logger, object_storage)
+    cql = manager.get_cql()
+
+    num_keys = 10
+    cf = 'test'
+    prefix = 'nested/backup-root'
+
+    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {topology.rf}}}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} ( pk text primary key, value int ) WITH tablets = {{'min_tablet_count': 4}};")
+        await insert_keys(cql, ks, cf, num_keys)
+        snap_name, manifest = await back_up_cluster_snapshot(manager, object_storage, servers, ks, cf, prefix)
+
+    assert_manifest_is_deduplicated(manifest)
+
+    async with new_test_keyspace(manager, keyspace_options(object_storage, rf=topology.rf)) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} ( pk text primary key, value int );")
+
+        manifests = [f'{prefix}/snapshots/{snap_name}/manifest.json']
+        tid = await manager.api.restore_tablets(servers[0].ip_addr, ks, cf, snap_name, servers[0].datacenter,
+                                                object_storage.address, object_storage.bucket_name, manifests)
+        status = await manager.api.wait_task(servers[0].ip_addr, tid)
+        assert (status is not None) and (status['state'] == 'done'), f'Restore failed: {status}'
+        assert status['progress_total'] > 0
+        assert status['progress_completed'] == status['progress_total']
+
+        await check_mutation_replicas(cql, manager, servers, range(num_keys), topology, logger, ks, cf)
+
+
+async def test_restore_tablets_from_cluster_backup_rack_list(build_mode: str, manager: ManagerClient, object_storage):
+    '''Same as test_restore_tablets_from_cluster_backup_multi_rack, for a
+    destination keyspace whose replication factor is a rack list instead of a
+    number. The racks which own the replicas are then named by the replication
+    options rather than derived from the topology.'''
+
+    topology = topo(rf = 2, nodes = 2, racks = 2, dcs = 1)
+    servers, host_ids = await create_cluster(topology, manager, logger, object_storage)
+    cql = manager.get_cql()
+
+    num_keys = 10
+    cf = 'test'
+    prefix = 'rack-list-backup'
+    racks = sorted({s.rack for s in servers})
+    assert len(racks) == topology.racks
+
+    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {topology.rf}}}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} ( pk text primary key, value int ) WITH tablets = {{'min_tablet_count': 4}};")
+        await insert_keys(cql, ks, cf, num_keys)
+        snap_name, manifest = await back_up_cluster_snapshot(manager, object_storage, servers, ks, cf, prefix)
+
+    assert_manifest_is_deduplicated(manifest)
+
+    rack_list = ', '.join(f"'{rack}'" for rack in racks)
+    storage_opts = format_tuples(type=object_storage.type, endpoint=object_storage.address, bucket=object_storage.bucket_name)
+    opts = f"WITH replication = {{'class': 'NetworkTopologyStrategy', '{servers[0].datacenter}': [{rack_list}]}} AND STORAGE = {storage_opts}"
+    async with new_test_keyspace(manager, opts) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.{cf} ( pk text primary key, value int );")
+
+        manifests = [f'{prefix}/snapshots/{snap_name}/manifest.json']
+        tid = await manager.api.restore_tablets(servers[0].ip_addr, ks, cf, snap_name, servers[0].datacenter,
+                                                object_storage.address, object_storage.bucket_name, manifests)
+        status = await manager.api.wait_task(servers[0].ip_addr, tid)
+        assert (status is not None) and (status['state'] == 'done'), f'Restore failed: {status}'
+
+        await check_mutation_replicas(cql, manager, servers, range(num_keys), topology, logger, ks, cf)
