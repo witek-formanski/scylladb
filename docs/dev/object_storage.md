@@ -145,7 +145,7 @@ disk IO bandwidth and IOPS, CPU time, networking bandwidth) will be under Seasta
 control and regular Scylla workload will not be randomly affected.
 
 The API endpoint name is `/storage_service/backup` and its Swagger description can be
-found [here](./api/api-doc/storage_service.json). Accepted parameters are
+found [here](../../api/api-doc/storage_service.json). Accepted parameters are
 
 * *keyspace*: the keyspace to copy sstables from
 * *table*: the table to copy sstables from
@@ -154,17 +154,17 @@ found [here](./api/api-doc/storage_service.json). Accepted parameters are
 * *bucket*: bucket name to put sstables' files in
 * *prefix*: prefix to put sstables' files under
 
-Currently only snapshot backup is possible, so first one needs to take [snapshot](docs/kb/snapshots.rst)
+Currently only snapshot backup is possible, so first one needs to take [snapshot](../kb/snapshots.rst)
 
-All tables in a keyspace are uploaded, the destination object names will look like
+One table is uploaded per call, the destination object names will look like
 `s3://bucket/some/prefix/to/store/data/.../sstable`
 or 
 `gs://bucket/some/prefix/to/store/data/.../sstable`
 
 # System tables
 There are a few system tables that object storage related code needs to touch in order to operate.
-* [system_distributed.snapshot_sstables](docs/dev/snapshot_sstables.md) - Used during restore by worker nodes to get the list of SSTables that need to be downloaded from object storage and restored locally.
-* [system.sstables](docs/dev/system_keyspace.md#systemsstables) - Used to keep track of SSTables on object storage when a keyspace is created with object storage storage_options.
+* [system_distributed.snapshot_sstables](./snapshot_sstables.md) - Used during restore by worker nodes to get the list of SSTables that need to be downloaded from object storage and restored locally.
+* [system.sstables](./system_keyspace.md#systemsstables) - Used to keep track of SSTables on object storage when a keyspace is created with object storage storage_options.
 
 # Manipulating S3 data
 
@@ -183,7 +183,7 @@ Issue tracking the document [here](https://github.com/scylladb/scylladb/issues/2
 
 ## Object Storage Layout
 
-There are currently three mechanisms in Scylla which write data to S3/GS:
+There are currently four mechanisms in Scylla which write data to S3/GS:
 
 1. Scylla Manager backup
 
@@ -220,90 +220,20 @@ scylla-bucket/prefix/
 ```
 See the API [documentation](#copying-sstables-on-s3-backup) for more details about the actual backup request.
 
-### The snapshot manifest
+3. `/storage_service/tablets/backup` REST API (cluster backup)
 
-Each table snapshot directory contains a manifest.json file that lists the contents of the snapshot and some metadata.
-The json structure is as follows:
-```
-{
-  "manifest": {
-    "version": "1.0",
-    "scope": "node"
-  },
-  "node": {
-    "host_id": "<UUID>",
-    "datacenter": "mydc",
-    "rack": "myrack"
-  },
-  "snapshot": {
-    "name": "snapshot name",
-    "created_at": seconds_since_epoch,
-    "expires_at": seconds_since_epoch | null,
-  },
-  "table": {
-    "keyspace_name": "my_keyspace",
-    "table_name": "my_table",
-    "table_id": "<UUID>",
-    "tablets_type": "none|powof2",
-    "tablet_count": N
-  },
-  "sstables": [
-    {
-      "id": "67e35000-d8c6-11f0-9599-060de9f3bd1b",
-      "toc_name": "me-3gw7_0ndy_3wlq829wcsddgwha1n-big-TOC.txt",
-      "data_size": 75,
-      "index_size": 8,
-      "first_token": -8629266958227979430,
-      "last_token": 9168982884335614769,
-    },
-    {
-      "id": "67e35000-d8c6-11f0-85dc-0625e9f3bd1b",
-      "toc_name": "me-3gw7_0ndy_3wlq821a6cqlbmxrtn-big-TOC.txt",
-      "data_size": 73,
-      "index_size": 8,
-      "first_token": 221146791717891383,
-      "last_token": 7354559975791427036,
-    },
-    ...
-  ],
-  "files": [ ... ]
-}
+When using the `/storage_service/tablets/backup` REST API, one backup location is given per
+datacenter, and the data of every datacenter which maps to a location is stored under the
+prefix of that location. Unlike the `/storage_service/backup` API, the manifest and the
+component files are stored under two different prefixes: the manifest under
+`{prefix}/snapshots/{snapshot_name}/manifest.json` and the component files under
+`{prefix}/sstables/{sstable_id}/`. The component files keep the names they have in the local
+snapshot directory, so a component object is named
+`{prefix}/sstables/{sstable_id}/me-<generation>-big-Data.db`. A reference object
+`{prefix}/sstables/{sstable_id}/refs/snapshot-{snapshot_name}/{generation}` records which
+snapshot the component files were uploaded for.
 
-The `manifest` member contains the following attributes:
-- `version` - representing the version of the manifest itself. It is incremented when members are added or removed from the manifest.
-- `scope` - the scope of metadata stored in this manifest file.  The following scopes are supported:
-    - `node` - the manifest describes all SSTables owned by this node in this snapshot.
-    - `dc` - the manifest describes all SSTables backed up from one datacenter. Written by cluster backup.
-
-The `node` member contains metadata about this node that enables datacenter- or rack-aware restore.
-- `host_id` - is the node's unique host_id (a UUID).
-- `datacenter` - is the node's datacenter.
-- `rack` - is the node's rack.
-
-The `snapshot` member contains metadata about the snapshot.
-- `name` - is the snapshot name (a.k.a. `tag`)
-- `created_at` - is the time when the snapshot was created.
-- `expires_at` - is an optional time when the snapshot expires and can be dropped, if a TTL was set for the snapshot.  If there is no TTL, `expires_at` may be omitted, set to null, or set to 0.
-
-The `table` member contains metadata about the table being snapshot.
-- `keyspace_name` and `table_name` - are self-explanatory.
-- `table_id` - a universally unique identifier (UUID) of the table set when the table is created.
-- `tablets_type`:
-    - `none` - if the keyspace uses vnodes replication
-    - `powof2` - if the keyspace uses tablets replication, and the tablet token ranges are based on powers of 2.
-    - `arbitrary` - if the keyspace uses tablets replication, and the tablet token ranges and count can be arbitrary.
-- `tablet_count` - Optional. If `tablets_type` is not `none`, contains the number of tablets allcated in the table. If `tablets_type` is `powof2`, tablet_count would be a power of 2.
-
-The `sstables` member is a list containing metadata about the SSTables in the snapshot.
-- `id` - is the STable's unique id (a UUID).  It is carried over with the SSTable when it's streamed as part of tablet migration, even if it gets a new generation.
-- `toc_name` - is the name of the SSTable Table Of Contents (TOC) component.
-- `data_size` and `index_size` - are the sizes of the SSTable's data and index components, respectively.  They can be used to estimate how much disk space is needed for restore.
-- `first_token` and `last_token` - are the first and last tokens in the SSTable, respectively.  They can be used to determine if a SSTable is fully contained in a (tablet) token range to enable efficient file-based streaming of the SSTable.
-
-The optional `files` member may contain a list of non-SSTable files included in the snapshot directory, not including the manifest.json file and schema.cql.
-```
-
-3. `CREATE KEYSPACE` with S3/GS storage
+4. `CREATE KEYSPACE` with S3/GS storage
 
 When creating a keyspace with S3/GS storage, the data is stored under the bucket passed as argument to the `CREATE KEYSPACE` statement.
 Once the statement is issued, Scylla will transparently use the S3/GS bucket as the location of the SSTables for that keyspace.
@@ -371,6 +301,129 @@ Object-storage SSTable lifecycle:
 
 The `status` and `state` fields in `system.sstables` describe the local SSTable entry lifecycle. They do not describe a global lifecycle state for the object-storage component set identified by `sstable_id`.
 
+### The snapshot manifest
+
+A snapshot is described by a manifest.json file. Two writers produce one and they fill
+different members, so a reader has to read `manifest.scope` first and interpret the rest of the
+file accordingly. A member which the writer does not fill is absent from the file, it is not
+present with a null value.
+
+- Scope `node` is written by a local snapshot, one manifest per node, into the table snapshot
+  directory. The `/storage_service/backup` API does not write a manifest of its own: it uploads
+  the one the local snapshot wrote, next to the component files, under the prefix passed to the
+  API.
+- Scope `dc` is written by cluster backup, one manifest per backup location. Several
+  datacenters can be backed up to the same location, in which case one manifest describes all
+  of them and the `nodes` member lists the nodes of all of them. The manifest.json file is
+  stored under `{prefix}/snapshots/{snapshot_name}/` while the component files are stored under
+  `{prefix}/sstables/{sstable_id}/`, see the cluster backup layout above.
+
+Cluster backup does not store every replica of a token range. Of the SSTables which belong to
+the repaired set of a tablet it stores those of a single node only, so for such a token range a
+manifest with scope `dc` describes one copy of the data and the rack an SSTable was backed up
+from does not identify a replica of the restored table. SSTables which are not in the repaired
+set are stored from every node which owns them. The replication factor is not recorded in the
+manifest.
+
+The json structure is as follows:
+
+```json
+{
+  "manifest": {
+    "version": "1.0",
+    "scope": "node|dc"
+  },
+  "node": {
+    "host_id": "<UUID>",
+    "datacenter": "mydc",
+    "rack": "myrack"
+  },
+  "nodes": [
+    {
+      "host_id": "<UUID>",
+      "datacenter": "mydc",
+      "rack": "myrack"
+    }
+  ],
+  "snapshot": {
+    "name": "snapshot name",
+    "created_at": 1767225600,
+    "expires_at": 0
+  },
+  "table": {
+    "keyspace_name": "my_keyspace",
+    "table_name": "my_table",
+    "table_id": "<UUID>",
+    "tablets_type": "none|powof2|arbitrary",
+    "tablet_count": 4
+  },
+  "tablets": [
+    {
+      "id": 0,
+      "first_token": -9223372036854775808,
+      "last_token": -4611686018427387905,
+      "repair_time": 0,
+      "repaired_at": 0
+    }
+  ],
+  "sstables": [
+    {
+      "id": "67e35000-d8c6-11f0-9599-060de9f3bd1b",
+      "toc_name": "me-3gw7_0ndy_3wlq829wcsddgwha1n-big-TOC.txt",
+      "data_size": 75,
+      "index_size": 8,
+      "first_token": -8629266958227979430,
+      "last_token": 9168982884335614769,
+      "tablet_id": 0,
+      "repaired_at": 0,
+      "node": "<UUID>"
+    }
+  ]
+}
+```
+
+The `manifest` member contains the following attributes:
+- `version` - representing the version of the manifest itself. It is incremented when members are added or removed from the manifest.
+- `scope` - the scope of metadata stored in this manifest file.  The following scopes are supported:
+    - `node` - the manifest describes all SSTables owned by this node in this snapshot.
+    - `dc` - the manifest describes the SSTables backed up from one datacenter. Written by cluster backup.
+
+The `node` member contains metadata about the node the manifest describes, which enables datacenter- or rack-aware restore. Written for scope `node` only.
+- `host_id` - is the node's unique host_id (a UUID).
+- `datacenter` - is the node's datacenter.
+- `rack` - is the node's rack.
+
+The `nodes` member is a list containing the same metadata about every node of the datacenter the manifest describes. Written for scope `dc` only, where an SSTable entry names its node instead of the manifest naming one node.
+- `host_id`, `datacenter`, `rack` - as in the `node` member.
+
+The `snapshot` member contains metadata about the snapshot.
+- `name` - is the snapshot name (a.k.a. `tag`)
+- `created_at` - is the time when the snapshot was created.
+- `expires_at` - is an optional time when the snapshot expires and can be dropped, if a TTL was set for the snapshot.  If there is no TTL, `expires_at` may be omitted or set to 0.
+
+The `table` member contains metadata about the table being snapshot.
+- `keyspace_name` and `table_name` - are self-explanatory.
+- `table_id` - a universally unique identifier (UUID) of the table set when the table is created.
+- `tablets_type`:
+    - `none` - if the keyspace uses vnodes replication
+    - `powof2` - if the keyspace uses tablets replication, and the tablet token ranges are based on powers of 2.
+    - `arbitrary` - if the keyspace uses tablets replication, and the tablet token ranges and count can be arbitrary.
+- `tablet_count` - if `tablets_type` is not `none`, contains the number of tablets allocated in the table. If `tablets_type` is `powof2`, tablet_count would be a power of 2.
+
+The `tablets` member is a list describing the tablets of the table at the time of the snapshot. Written for a table which uses tablets.
+- `id` - is the tablet id.
+- `first_token` and `last_token` - are the first and last tokens of the tablet's token range.
+- `repair_time` and `repaired_at` - describe the last repair of the tablet. An SSTable whose `repaired_at` is not older than the `repaired_at` of its tablet belongs to the repaired set of that tablet, which is what lets cluster backup store one replica of the range only.
+
+The `sstables` member is a list containing metadata about the SSTables in the snapshot.
+- `id` - is the SSTable's unique id (a UUID).  It is carried over with the SSTable when it's streamed as part of tablet migration, even if it gets a new generation.
+- `toc_name` - is the name of the SSTable Table Of Contents (TOC) component.
+- `data_size` and `index_size` - are the sizes of the SSTable's data and index components, respectively.  They can be used to estimate how much disk space is needed for restore.
+- `first_token` and `last_token` - are the first and last tokens in the SSTable, respectively.  They can be used to determine if a SSTable is fully contained in a (tablet) token range to enable efficient file-based streaming of the SSTable.
+- `tablet_id` - is the id of the tablet which owned the SSTable. Written for a table which uses tablets.
+- `repaired_at` - is the time of the repair the SSTable belongs to, or 0 for an SSTable which was never repaired.
+- `node` - is the host_id of the node the SSTable was backed up from, described by the `nodes` member. Written for scope `dc` only.
+
 ### Restore into object-storage tables
 
 Tablet-aware restore, the `/storage_service/tablets/restore` API, writes the downloaded components through the storage of the destination table, so a table which uses object storage receives them as objects of its own bucket.
@@ -421,8 +474,8 @@ aws s3 rm s3://your-bucket/path-to-sstables/ --exclude "*" --include 'some-sstab
 ### Uploading SSTables
 components individually
 ```sh
- aws s3 cp /local/path/to/sstable/me-3gqb_1izi_0pxn421yzymfw5c8zf-big-Data.db s3://your-bucket/path/to/sstable/component
- ```
+aws s3 cp /local/path/to/sstable/me-3gqb_1izi_0pxn421yzymfw5c8zf-big-Data.db s3://your-bucket/path/to/sstable/component
+```
 or the entire SSTable using globs
 ```sh
 aws s3 cp /local/path/for/sstables s3://your-bucket/path-to-sstables/ --exclude "*" --include 'some-sstable-generation-big-*' --recursive
