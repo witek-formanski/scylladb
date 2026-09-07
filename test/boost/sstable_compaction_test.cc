@@ -72,6 +72,8 @@
 #include "utils/assert.hh"
 #include "utils/pretty_printers.hh"
 #include "sstables/exceptions.hh"
+#include "sstables/object_storage_client.hh"
+#include "utils/lister.hh"
 
 BOOST_AUTO_TEST_SUITE(sstable_compaction_test)
 
@@ -7789,6 +7791,134 @@ SEASTAR_FIXTURE_TEST_CASE(test_object_storage_perform_component_rewrite_single_s
     return test_env::do_with_async([] (test_env& env) { object_storage_perform_component_rewrite_single_sstable_fn(env); },
             test_env_config{.storage = make_test_object_storage_options("GS")});
 }
+
+static void snapshot_creates_links_fn(test_env& env) {
+    simple_schema ss;
+    auto s = ss.schema();
+
+    auto mut = mutation(s, tests::generate_partition_key(s).key());
+    mut.partition().apply_insert(*s, ss.make_ckey(0), ss.new_timestamp());
+    auto sst = make_sstable_containing(env.make_sstable(s), {std::move(mut)}).get();
+
+    const sstring tag = "snapshot_creates_links";
+    auto snapshot_dir = std::filesystem::path(env.tempdir().path()) / sstables::snapshots_dir / std::string_view(tag);
+    // The snapshot writer creates the directory tree; storage only touches the leaf.
+    touch_directory(snapshot_dir.parent_path().native()).get();
+    sst->snapshot(tag).get();
+
+    for (auto type : {component_type::TOC, component_type::Data, component_type::Statistics}) {
+        BOOST_REQUIRE(file_exists((snapshot_dir / sst->component_basename(type)).native()).get());
+    }
+}
+
+SEASTAR_TEST_CASE(snapshot_creates_links) {
+    return test_env::do_with_async([] (test_env& env) { snapshot_creates_links_fn(env); });
+}
+
+static void object_storage_snapshot_ref_fn(test_env& env) {
+    simple_schema ss;
+    auto s = ss.schema();
+
+    auto mut = mutation(s, tests::generate_partition_key(s).key());
+    mut.partition().apply_insert(*s, ss.make_ckey(0), ss.new_timestamp());
+    auto sst = make_sstable_containing(env.make_sstable(s), {std::move(mut)}).get();
+
+    auto so = env.get_storage_options();
+    const auto& os = std::get<data_dictionary::storage_options::object_storage>(so.value);
+    auto client = env.manager().get_endpoint_client(os.endpoint);
+    const sstring bucket = os.bucket;
+    const sstring prefix{sst->get_storage().prefix()};
+    const auto sid = *sst->sstable_identifier();
+    const auto gen = sst->generation();
+
+    auto list_refs = [&] {
+        auto refs = sstables::list_object_storage_references(*client, bucket, prefix, sid).get();
+        std::ranges::sort(refs);
+        return refs;
+    };
+    auto list_components = [&] {
+        std::set<sstring> names;
+        auto lister = client->make_object_lister(bucket, format("{}/{}/", prefix, sid),
+                [] (const std::filesystem::path&, const directory_entry&) { return true; });
+        with_closeable(std::move(lister), [&names] (abstract_lister& l) -> future<> {
+            while (auto entry = co_await l.get()) {
+                if (!std::string_view(entry->name).starts_with("refs/")) {
+                    names.insert(entry->name);
+                }
+            }
+        }).get();
+        return names;
+    };
+
+    const auto components = list_components();
+    BOOST_REQUIRE(components.contains("Data.db"));
+
+    const sstring tag = "object_storage_snapshot_ref";
+    sst->snapshot(tag).get();
+
+    // The snapshot ref sits next to this node's own ref, both under the
+    // sstable's refs/ prefix, so it is counted by num_references().
+    auto refs = list_refs();
+    BOOST_REQUIRE_EQUAL(refs.size(), 2);
+    BOOST_REQUIRE_EQUAL(refs[0], format("nodes/{}/{}", env.manager().get_local_host_id(), gen));
+    BOOST_REQUIRE_EQUAL(refs[1], format("snapshot-{}/{}", tag, gen));
+
+    // Releasing this node's reference - what destroy() and boot-time garbage
+    // collection do once the sstable is compacted away - must leave the
+    // components alone while the snapshot reference still names them.
+    sstables::test(sst).get_storage().remove_by_registry_entry(sst->get_descriptor(component_type::TOC),
+            env.manager().get_local_host_id()).get();
+
+    refs = list_refs();
+    BOOST_REQUIRE_EQUAL(refs.size(), 1);
+    BOOST_REQUIRE_EQUAL(refs[0], format("snapshot-{}/{}", tag, gen));
+    BOOST_REQUIRE(list_components() == components);
+}
+
+SEASTAR_TEST_CASE(object_storage_snapshot_ref_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+    return test_env::do_with_async([] (test_env& env) { object_storage_snapshot_ref_fn(env); },
+            test_env_config{.storage = make_test_object_storage_options("S3")});
+}
+
+SEASTAR_FIXTURE_TEST_CASE(object_storage_snapshot_ref_gcs, gcs_fixture, *tests::check_run_test_decorator("ENABLE_GCP_STORAGE_TEST", true)) {
+    return test_env::do_with_async([] (test_env& env) { object_storage_snapshot_ref_fn(env); },
+            test_env_config{.storage = make_test_object_storage_options("GS")});
+}
+
+static void object_storage_incremental_backup_is_ignored_fn(test_env& env) {
+    simple_schema ss;
+    auto s = ss.schema();
+
+    auto mut = mutation(s, tests::generate_partition_key(s).key());
+    mut.partition().apply_insert(*s, ss.make_ckey(0), ss.new_timestamp());
+
+    // Sealing with backups on used to abort the node through
+    // object_storage_base::snapshot()'s on_internal_error.
+    sstable_writer_config cfg = env.manager().configure_writer();
+    cfg.backup = true;
+    auto sst = make_sstable_easy(env, make_mutation_reader_from_mutations(s, env.make_reader_permit(), std::move(mut)), cfg);
+
+    auto so = env.get_storage_options();
+    const auto& os = std::get<data_dictionary::storage_options::object_storage>(so.value);
+    auto client = env.manager().get_endpoint_client(os.endpoint);
+    auto refs = sstables::list_object_storage_references(*client, sstring(os.bucket),
+            sst->get_storage().prefix(), *sst->sstable_identifier()).get();
+
+    // Only this node's own ref: nothing was pinned for the backup.
+    BOOST_REQUIRE_EQUAL(refs.size(), 1);
+    BOOST_REQUIRE_EQUAL(refs[0], format("nodes/{}/{}", env.manager().get_local_host_id(), sst->generation()));
+}
+
+SEASTAR_TEST_CASE(object_storage_incremental_backup_is_ignored_s3, *boost::unit_test::precondition(tests::has_scylla_test_env)) {
+    return test_env::do_with_async([] (test_env& env) { object_storage_incremental_backup_is_ignored_fn(env); },
+            test_env_config{.storage = make_test_object_storage_options("S3")});
+}
+
+SEASTAR_FIXTURE_TEST_CASE(object_storage_incremental_backup_is_ignored_gcs, gcs_fixture, *tests::check_run_test_decorator("ENABLE_GCP_STORAGE_TEST", true)) {
+    return test_env::do_with_async([] (test_env& env) { object_storage_incremental_backup_is_ignored_fn(env); },
+            test_env_config{.storage = make_test_object_storage_options("GS")});
+}
+
 
 SEASTAR_TEST_CASE(test_perform_component_rewrite_multiple_sstables) {
     return test_env::do_with_async([] (test_env& env) {
