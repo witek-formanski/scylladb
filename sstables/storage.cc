@@ -91,7 +91,7 @@ public:
     {}
 
     virtual future<> seal(const sstable& sst) override;
-    virtual future<> snapshot(const sstable& sst, sstring name) const override;
+    virtual future<> snapshot(const sstable& sst, sstring tag, incremental_backup inc_backup) const override;
     virtual future<entry_descriptor> clone(sstable& sst, generation_type gen, bool leave_unsealed, bool may_use_reference_sharing = false) const override;
     virtual future<> change_state(const sstable& sst, sstable_state state, generation_type generation, delayed_commit_changes* delay) override;
     // runs in async context
@@ -449,8 +449,10 @@ future<> filesystem_storage::link_with_excluded_components(const sstable& sst, g
     sstlog.trace("link_with_excluded_components: {} -> generation={}: done", sst.get_filename(), new_gen);
 }
 
-future<> filesystem_storage::snapshot(const sstable& sst, sstring name) const {
-    std::filesystem::path snapshot_dir = _base_dir.path() / name;
+future<> filesystem_storage::snapshot(const sstable& sst, sstring tag, incremental_backup inc_backup) const {
+    std::filesystem::path snapshot_dir = inc_backup
+            ? _base_dir.path() / "backups"
+            : _base_dir.path() / sstables::snapshots_dir / std::string_view(tag);
     co_await sst.sstable_touch_directory_io_check(snapshot_dir);
     co_await create_links_common(sst, snapshot_dir.native(), sst._generation, link_mode::default_mode);
 }
@@ -681,6 +683,11 @@ protected:
         return object_name(_bucket, prefix(), sid, fmt::format("refs/nodes/{}/{}", host_id, gen));
     }
 
+    // Construct the object name for a snapshot reference: {prefix}/{sstable_id}/refs/snapshot-{tag}/{gen}
+    object_name make_snapshot_ref_object_name(sstable_id sid, generation_type gen, std::string_view tag) const {
+        return object_name(_bucket, prefix(), sid, fmt::format("refs/snapshot-{}/{}", tag, gen));
+    }
+
     table_id owner() const {
         if (_uses_foreign_location) {
             on_internal_error(sstlog, format("Storage holds '{}' prefix, but registry owner is expected", prefix()));
@@ -704,7 +711,7 @@ public:
     }
 
     future<> seal(const sstable& sst) override;
-    future<> snapshot(const sstable& sst, sstring name) const override;
+    future<> snapshot(const sstable& sst, sstring tag, incremental_backup inc_backup) const override;
     future<entry_descriptor> clone(sstable& sst, generation_type gen, bool leave_unsealed, bool may_use_reference_sharing = false) const override;
     future<> change_state(const sstable& sst, sstable_state state, generation_type generation, delayed_commit_changes* delay) override;
     // runs in async context
@@ -1130,9 +1137,22 @@ future<> object_storage_base::unlink_component(const sstable& sst, component_typ
     }
 }
 
-future<> object_storage_base::snapshot(const sstable& sst, sstring name) const {
-    on_internal_error(sstlog, "Snapshotting S3 objects not implemented");
-    co_return;
+future<> object_storage_base::snapshot(const sstable& sst, sstring tag, incremental_backup inc_backup) const {
+    if (inc_backup) {
+        // An incremental backup hard-links every freshly sealed sstable into the
+        // table's backups directory. On object storage the components are already
+        // remote and immutable, so there is nothing the copy would buy; the
+        // cluster backup path pins them through snapshot refs instead.
+        static thread_local logger::rate_limit rate_limit(std::chrono::hours(1));
+        sstlog.log(log_level::warn, rate_limit, "Incremental backups are not supported for {} tables, ignoring for {}.{}",
+                _type, _schema->ks_name(), _schema->cf_name());
+        co_return;
+    }
+
+    auto sid = get_sstable_identifier(sst);
+    auto ref_name = make_snapshot_ref_object_name(sid, sst.generation(), tag);
+    co_await put_object(ref_name, memory_data_sink_buffers());
+    sstlog.debug("Created snapshot reference {}", ref_name.str());
 }
 
 future<> object_storage_base::copy_components(const sstable& sst, sstable_id sid, const std::unordered_set<component_type>& excluded_components) const {

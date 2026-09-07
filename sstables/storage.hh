@@ -61,6 +61,8 @@ public:
 
 using object_storage_reference_names = utils::small_vector<sstring, 3>;
 
+using incremental_backup = bool_class<struct incremental_backup_tag>;
+
 class opened_directory final {
     std::filesystem::path _pathname;
     file _file;
@@ -118,7 +120,10 @@ public:
     using sync_dir = bool_class<struct sync_dir_tag>; // meaningful only to filesystem storage
 
     virtual future<> seal(const sstable& sst) = 0;
-    virtual future<> snapshot(const sstable& sst, sstring name) const = 0;
+    // Pins the sstable's components under `tag`. With `inc_backup` set the call
+    // comes from the incremental-backup hook and `tag` is empty; each backend
+    // picks the location to pin at.
+    virtual future<> snapshot(const sstable& sst, sstring tag, incremental_backup inc_backup) const = 0;
     // `may_use_reference_sharing` is a hint: storage backends may ignore it
     // and use their natural clone method.
     virtual future<entry_descriptor> clone(sstable& sst, generation_type gen, bool leave_unsealed, bool may_use_reference_sharing = false) const = 0;
