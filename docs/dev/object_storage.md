@@ -320,11 +320,13 @@ scylla-sstables-bucket/
     │   ├── TOC.txt
     │   ├── ...
     │   └── refs/
-    │       └── nodes/
-    │           ├── 7adf1ca2-6783-40ab-aa1f-ef1e0b5d98ba/
-    │           │   └── 3gqe_1lnj_4sbpc2ezoscu9hhtor
-    │           └── 10e68be1-d352-4173-bf34-2249dbb7329e/
-    │               └── 4c5s_0281_0v5kg2b4gri84iggoz
+    │       ├── nodes/
+    │       │   ├── 7adf1ca2-6783-40ab-aa1f-ef1e0b5d98ba/
+    │       │   │   └── 3gqe_1lnj_4sbpc2ezoscu9hhtor
+    │       │   └── 10e68be1-d352-4173-bf34-2249dbb7329e/
+    │       │       └── 4c5s_0281_0v5kg2b4gri84iggoz
+    │       └── snapshot-my_snapshot/
+    │           └── 3gqe_1lnj_4sbpc2ezoscu9hhtor
     ├── 87a72290-d8c6-11f0-a5ea-060de9f3bd1b/
     │   ├── Data.db
     │   ├── Index.db
@@ -360,13 +362,24 @@ sstables/{sstable_id}/refs/nodes/{host_id}/{generation}
 
 The reference object body is empty. Its name is the metadata: `{host_id}` identifies the node and `{generation}` is that node's local SSTable generation name for the shared SSTable.
 
+Taking a snapshot adds a reference of its own, so that the components stay in the bucket after the live SSTable is compacted away:
+
+```text
+sstables/{sstable_id}/refs/snapshot-{tag}/{generation}
+```
+
+Both kinds of reference live under the same `refs/` prefix and count the same way, so component objects survive for as long as either a node or a snapshot still names them.
+
+Incremental backups have no object-storage equivalent - the components are already remote and immutable - so enabling them on an object-storage keyspace logs a warning and does nothing.
+
 The `sstable_id` identifies the shared object-storage SSTable data. The local `generation` identifies a node-local SSTable entry in `system.sstables`. A newly created SSTable normally has an `sstable_id` derived from its generation. After tablet migration or reference sharing, multiple local SSTable entries can have different generations while pointing at the same object-storage data via the same `sstable_id`.
 
 Object-storage SSTable lifecycle:
 - Creation: Scylla uploads component objects under `{sstable_id}` and creates this node's `refs/nodes/{host_id}/{generation}` reference before sealing the local row in `system.sstables`.
 - Sharing: when tablet migration can share object-storage data, the receiving node creates a new local SSTable entry with its own generation and adds a node reference under the existing `{sstable_id}` prefix instead of copying all component objects.
 - Local removal: when a node removes its local SSTable, it first deletes its own reference object. If other references remain, component objects are left intact.
-- Final cleanup: component objects are deleted only after no reference objects remain for the `sstable_id`. This prevents one node from deleting shared data still referenced by another node.
+- Snapshotting: a snapshot creates one `refs/snapshot-{tag}/{generation}` reference per live SSTable, pinning its components independently of any node reference.
+- Final cleanup: component objects are deleted only after no reference objects remain for the `sstable_id`. This prevents one node from deleting shared data still referenced by another node, or data still pinned by a snapshot.
 
 The `status` and `state` fields in `system.sstables` describe the local SSTable entry lifecycle. They do not describe a global lifecycle state for the object-storage component set identified by `sstable_id`.
 
@@ -436,7 +449,7 @@ There is high likelihood that a scrubbed SSTable results in different values for
 For the `storage_service/backup` REST API, in theory only removing an entire SSTable from the backup would require changing  
 the manifest file and remove the corresponding entry for the SSTable, in all other cases, no metadata changes needed.
 
-For `CREATE KEYSPACE` on S3/GS storage, Scylla tracks object-storage SSTables in `system.sstables` and uses reference objects under the SSTable prefix to decide when component objects can be deleted. Manual changes to the objects under this layout should keep `system.sstables`, component objects, and `refs/nodes/{host_id}/{generation}` objects consistent.
+For `CREATE KEYSPACE` on S3/GS storage, Scylla tracks object-storage SSTables in `system.sstables` and uses reference objects under the SSTable prefix to decide when component objects can be deleted. Manual changes to the objects under this layout should keep `system.sstables`, component objects, and `refs/nodes/{host_id}/{generation}` and `refs/snapshot-{tag}/{generation}` objects consistent.
 
 > **NOTE:**
 > It’s obvious to say that re-uploading a scrubbed SSTable means re-uploading all its components as it’s likely most of them were changed.
