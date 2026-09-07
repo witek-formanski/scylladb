@@ -726,6 +726,38 @@ async def test_registry_cleanup_on_all_nodes(manager: ManagerClient, object_stor
         await assert_registry_empty_on_all_nodes(cql, hosts, table_id, operation)
 
 
+async def test_incremental_backups_are_ignored(manager: ManagerClient, object_storage):
+    """Enabling incremental backups on an object-storage keyspace used to abort
+    the node: sealing an sstable with backups on reached the storage layer's
+    unimplemented snapshot(). It must now be a no-op instead."""
+    cfg = {'object_storage_endpoints': object_storage.create_endpoint_conf()}
+    server = await manager.server_add(config=cfg)
+    cql = manager.get_cql()
+
+    await manager.api.client.post("/storage_service/incremental_backups",
+                                  host=server.ip_addr, params={"value": "true"})
+
+    async with new_test_keyspace(manager, keyspace_options(object_storage)) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v int)")
+        await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES (0, 0)")
+        await manager.api.flush_keyspace(server.ip_addr, ks)
+
+        # The node survived the flush and serves the flushed row.
+        rows = await cql.run_async(f"SELECT v FROM {ks}.test WHERE pk = 0")
+        assert [r.v for r in rows] == [0]
+
+        log = await manager.server_open_log(server.server_id)
+        assert await log.grep(r'WARN.*Incremental backups are not supported'), \
+            'the backup hook was never reached'
+
+        objects = list(object_storage.get_resource().Bucket(object_storage.bucket_name).objects.all())
+        assert any(o.key.endswith('/Data.db') for o in objects), 'the flush wrote no sstable'
+        # Nothing was pinned for the backup: the only refs are this node's own.
+        for o in objects:
+            _, has_refs, ref = o.key.rpartition("/refs/")
+            assert not has_refs or ref.startswith("nodes/"), f'Unexpected reference {o.key}'
+
+
 @pytest.mark.asyncio
 async def test_stream_sink_abort_on_object_storage(manager: ManagerClient, object_storage):
     """Verify that aborting a blob stream on object storage cleans up
