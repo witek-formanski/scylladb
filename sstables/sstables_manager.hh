@@ -309,7 +309,13 @@ public:
     }
 
     atomic_deletion make_atomic_deletion(std::vector<shared_sstable> ssts);
-    future<utils::chunked_vector<sstable_snapshot_metadata>> take_snapshot(std::vector<shared_sstable> ssts, sstring jsondir);
+    // Describes `ssts` for the snapshot manifest and for the snapshot catalog
+    // tables. Purely observational: nothing is pinned yet.
+    future<utils::chunked_vector<sstable_snapshot_metadata>> collect_snapshot_metadata(const std::vector<shared_sstable>& ssts);
+    // Pins `ssts` under `tag` so they survive being compacted away. Run it only
+    // after the catalog rows describing them are durable, so that a crash can
+    // never leave behind a pin that nothing accounts for.
+    future<> create_snapshot_refs(const std::vector<shared_sstable>& ssts, sstring tag);
     future<lw_shared_ptr<const data_dictionary::storage_options>> init_table_storage(const schema& s, const data_dictionary::storage_options& so);
     future<> destroy_table_storage(const data_dictionary::storage_options& so);
     future<> init_keyspace_storage(const data_dictionary::storage_options& so, sstring dir);

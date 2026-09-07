@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/switch_to.hh>
 #include <unordered_map>
@@ -462,27 +463,33 @@ atomic_deletion sstables_manager::make_atomic_deletion(std::vector<shared_sstabl
     return atomic_deletion(std::move(ssts));
 }
 
-future<utils::chunked_vector<sstable_snapshot_metadata>> sstables_manager::take_snapshot(std::vector<shared_sstable> ssts, sstring name) {
+future<utils::chunked_vector<sstable_snapshot_metadata>> sstables_manager::collect_snapshot_metadata(const std::vector<shared_sstable>& ssts) {
     utils::chunked_vector<sstable_snapshot_metadata> sstables_metadata;
+    sstables_metadata.reserve(ssts.size());
 
-    co_await _dir_semaphore.parallel_for_each(ssts, [&] (sstables::shared_sstable sstable) {
+    for (const auto& sstable : ssts) {
         auto& sst_stats = sstable->get_stats_metadata();
-        sstable_snapshot_metadata md = {
+        sstables_metadata.push_back(sstable_snapshot_metadata {
             .id = sstable->sstable_identifier()->uuid(),
             .toc_name = sstable->component_basename(sstables::component_type::TOC),
             .data_size = sstable->data_size(),
             .index_size = sstable->index_size(),
             .first_token = dht::token::to_int64(sstable->get_first_decorated_key().token()),
             .last_token = dht::token::to_int64(sstable->get_last_decorated_key().token()),
-            .repaired_at = sst_stats.repaired_at, 
-        };
-        sstables_metadata.push_back(std::move(md));
-        return io_check([sstable, &name] {
-            return sstable->snapshot(name);
+            .repaired_at = sst_stats.repaired_at,
         });
-    });
+        co_await coroutine::maybe_yield();
+    }
 
     co_return sstables_metadata;
+}
+
+future<> sstables_manager::create_snapshot_refs(const std::vector<shared_sstable>& ssts, sstring tag) {
+    co_await _dir_semaphore.parallel_for_each(ssts, [&tag] (sstables::shared_sstable sstable) {
+        return io_check([sstable, &tag] {
+            return sstable->snapshot(tag);
+        });
+    });
 }
 
 future<> sstables_manager::close() noexcept {

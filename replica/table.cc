@@ -4187,7 +4187,9 @@ future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, c
         co_await smp::invoke_on_all([&] -> future<> {
             auto& t = *table_shards;
             auto [tables, permit] = co_await t.snapshot_sstables();
-            auto sstables_metadata = co_await t.get_sstables_manager().take_snapshot(std::move(tables), name);
+            auto& sstm = t.get_sstables_manager();
+            auto sstables_metadata = co_await sstm.collect_snapshot_metadata(tables);
+            co_await sstm.create_snapshot_refs(tables, name);
             sstable_sets[this_shard_id()] = make_foreign(std::make_unique<utils::chunked_vector<sstables::sstable_snapshot_metadata>>(std::move(sstables_metadata)));
         });
         co_await writer->sync();
