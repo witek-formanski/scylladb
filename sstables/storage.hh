@@ -152,6 +152,11 @@ public:
 
 std::unique_ptr<sstables::storage> make_storage(sstables_manager& manager, schema_ptr schema, const data_dictionary::storage_options& s_opts, sstable_state state);
 future<object_storage_reference_names> list_object_storage_references(object_storage_client& client, sstring bucket, std::string_view prefix, sstable_id sid);
+// Deletes every component object of `sid`. Takes the client explicitly so that it
+// can be called for an sstable that has no live table behind it anymore, e.g. when
+// clearing the last snapshot that pinned it.
+future<> delete_object_storage_components(object_storage_client& client, sstring bucket, std::string_view prefix,
+        sstable_version_types version, sstable_id sid, bool log_errors, seastar::abort_source* as = nullptr);
 future<lw_shared_ptr<const data_dictionary::storage_options>> init_table_storage(const sstables_manager&, const schema&, const data_dictionary::storage_options& so);
 future<> destroy_table_storage(const data_dictionary::storage_options& so);
 future<> init_keyspace_storage(const sstables_manager&, const data_dictionary::storage_options& so, sstring ks_name);

@@ -828,11 +828,11 @@ future<size_t> object_storage_base::num_references(const sstable& sst) const {
     return num_references(get_sstable_identifier(sst));
 }
 
-future<> object_storage_base::delete_components(sstable_version_types version, sstable_id sid, bool log_errors) const {
-    auto prefix = this->prefix();
-    auto delete_component = [this, &prefix, &sid, log_errors] (std::string_view component) -> future<> {
+future<> delete_object_storage_components(object_storage_client& client, sstring bucket, std::string_view prefix,
+        sstable_version_types version, sstable_id sid, bool log_errors, seastar::abort_source* as) {
+    auto delete_component = [&] (std::string_view component) -> future<> {
         try {
-            co_await delete_object(object_name(_bucket, prefix, sid, component));
+            co_await client.delete_object(object_name(bucket, prefix, sid, component), as);
         } catch (const storage_io_error& e) {
             if (e.code().value() != ENOENT) {
                 throw;
@@ -841,7 +841,7 @@ future<> object_storage_base::delete_components(sstable_version_types version, s
             if (!log_errors) {
                 throw;
             }
-            sstlog.warn("Failed to delete {} object {} for sstable_id={}: {}", _type, component, sid, std::current_exception());
+            sstlog.warn("Failed to delete object {} for sstable_id={}: {}", component, sid, std::current_exception());
         }
     };
 
@@ -853,6 +853,10 @@ future<> object_storage_base::delete_components(sstable_version_types version, s
         co_await delete_component(entry.second);
     });
     co_await delete_component(sstable_version_constants::TOC_SUFFIX);
+}
+
+future<> object_storage_base::delete_components(sstable_version_types version, sstable_id sid, bool log_errors) const {
+    return delete_object_storage_components(*_client, _bucket, prefix(), version, sid, log_errors, abort_source());
 }
 
 void object_storage_base::open(sstable& sst) {
