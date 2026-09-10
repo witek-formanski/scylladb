@@ -372,6 +372,10 @@ Both kinds of reference live under the same `refs/` prefix and count the same wa
 
 Incremental backups have no object-storage equivalent - the components are already remote and immutable - so enabling them on an object-storage keyspace logs a warning and does nothing.
 
+A snapshot of an object-storage keyspace has no snapshot directory: nothing is written next to the data, and so `nodetool listsnapshots` does not report it. The cluster snapshot tables in `system_distributed` carry what the local `manifest.json` and `schema.cql` would.
+
+Backing such a snapshot up copies nothing. The destination has to be the location the keyspace already uses, because that is where the component objects are and a backup addresses them by the same names, and the snapshot references keep them there; the backup only writes its manifest and records the SSTables of the snapshot as backed up. A backup to another endpoint, bucket or prefix is rejected, since it would have to copy the objects, and so is a backup which moves the files, since those files are the live data of the table.
+
 The `sstable_id` identifies the shared object-storage SSTable data. The local `generation` identifies a node-local SSTable entry in `system.sstables`. A newly created SSTable normally has an `sstable_id` derived from its generation. After tablet migration or reference sharing, multiple local SSTable entries can have different generations while pointing at the same object-storage data via the same `sstable_id`.
 
 Object-storage SSTable lifecycle:
@@ -379,6 +383,7 @@ Object-storage SSTable lifecycle:
 - Sharing: when tablet migration can share object-storage data, the receiving node creates a new local SSTable entry with its own generation and adds a node reference under the existing `{sstable_id}` prefix instead of copying all component objects.
 - Local removal: when a node removes its local SSTable, it first deletes its own reference object. If other references remain, component objects are left intact.
 - Snapshotting: a snapshot creates one `refs/snapshot-{tag}/{generation}` reference per live SSTable, pinning its components independently of any node reference.
+- Backup: a backup of a snapshot into the location the keyspace already uses adds no object and no reference of its own; it promotes the snapshot to a backup by recording its SSTables as backed up.
 - Final cleanup: component objects are deleted only after no reference objects remain for the `sstable_id`. This prevents one node from deleting shared data still referenced by another node, or data still pinned by a snapshot.
 
 The `status` and `state` fields in `system.sstables` describe the local SSTable entry lifecycle. They do not describe a global lifecycle state for the object-storage component set identified by `sstable_id`.
