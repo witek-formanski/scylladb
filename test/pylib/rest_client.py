@@ -470,13 +470,15 @@ class ScyllaRESTAPIClient:
         }
         await self.client.delete("/storage_service/snapshots", host=node_ip, params=params)
 
-    async def backup_cluster_snapshot_to_locations(self, node_ip: str, ks: str, snapshot: str, locations: list, tables: list[str] = None) -> str:
+    async def backup_cluster_snapshot_to_locations(self, node_ip: str, ks: str, snapshot: str, locations: list, tables: list[str] = None, move_files: bool = False) -> str:
         """Backup cluster snapshot"""
         params = { 'keyspace': ks,
                    'snapshot': snapshot,
         }
         if tables:
             params['table'] = ','.join(tables)
+        if move_files:
+            params['move_files'] = 'true'
         return await self.client.post_json("/storage_service/tablets/backup", host=node_ip, params=params, json=locations)
 
     async def backup_cluster_snapshot(self, node_ip: str, ks: str, snapshot: str, datacenter: str, endpoint: str, bucket: str, prefix: str, tables: list[str] = None) -> str:

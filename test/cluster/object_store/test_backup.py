@@ -17,6 +17,7 @@ import random
 from typing import Callable, Awaitable
 from functools import partial
 from test.pylib.manager_client import ManagerClient, ServerInfo
+from test.pylib.object_storage import keyspace_options
 from test.cluster.util import wait_for_cql_and_get_hosts, get_replication, new_test_keyspace, new_test_table
 from test.pylib.rest_client import read_barrier, HTTPError
 from test.pylib.util import unique_name, wait_all
@@ -1791,3 +1792,110 @@ async def test_cluster_snapshot_repair_set_unique(manager: ManagerClient, object
     Tests a cluster snapshot reduces the snapshot sstable set by the current repair set for each tablet
     """
     await do_test_snapshot_on_all_nodes(manager, partial(run_cluster_backup_and_check_redundancy, object_storage), object_storage, True, True)
+
+
+def object_sizes(object_storage, prefix=''):
+    '''Every object of the test bucket under the prefix, mapped to its size.'''
+    bucket = object_storage.get_resource().Bucket(object_storage.bucket_name)
+    return {o.key: o.size for o in bucket.objects.filter(Prefix=prefix)}
+
+
+async def snapshot_object_storage_keyspace(manager: ManagerClient, ks, cf, num_keys):
+    '''Fill a table of an object-storage keyspace, flush it and take a cluster snapshot.'''
+    cql = manager.get_cql()
+    servers = await manager.running_servers()
+
+    await cql.run_async(f"CREATE TABLE {ks}.{cf} ( pk text primary key, value int ) WITH tablets = {{'min_tablet_count': 2}};")
+    await asyncio.gather(*(cql.run_async(f"INSERT INTO {ks}.{cf} ( pk, value ) VALUES ('{i}', {i});") for i in range(num_keys)))
+    await asyncio.gather(*(manager.api.flush_keyspace(s.ip_addr, ks) for s in servers))
+
+    snapshot_name = unique_name('snap_')
+    await manager.api.take_cluster_snapshot(servers[0].ip_addr, ks, tag=snapshot_name, tables=[cf])
+    return snapshot_name
+
+
+# Two nodes, because the system_distributed reads and writes of a cluster backup
+# cannot reach a quorum on a single one, one per rack, because a backup draws the
+# sstables of a node from a rack wide set.
+object_storage_backup_topology = topo(rf = 2, nodes = 2, racks = 2, dcs = 1)
+
+
+async def test_cluster_backup_of_object_storage_keyspace_copies_nothing(manager: ManagerClient, object_storage):
+    '''A cluster backup of a keyspace which already keeps its sstables in the
+    destination bucket writes no data object: the references of the snapshot hold
+    the objects in place, and the backup only writes the manifest and records the
+    snapshot as backed up.'''
+
+    topology = object_storage_backup_topology
+    servers, _ = await create_cluster(topology, manager, logger, object_storage)
+    cql = manager.get_cql()
+    cf = 'test'
+
+    async with new_test_keyspace(manager, keyspace_options(object_storage, rf=topology.rf)) as ks:
+        snapshot_name = await snapshot_object_storage_keyspace(manager, ks, cf, num_keys=10)
+        snapshotted = object_sizes(object_storage)
+
+        # The empty prefix is the location of the table itself: a backup appends
+        # 'sstables' to it, which is where the table keeps its objects.
+        tid = await manager.api.backup_cluster_snapshot(servers[0].ip_addr, ks, snapshot_name, servers[0].datacenter,
+                                                        object_storage.address, object_storage.bucket_name, '', tables=[cf])
+        status = await manager.api.wait_task(servers[0].ip_addr, tid)
+        assert (status is not None) and (status['state'] == 'done'), f'Backup failed: {status}'
+
+        manifest_key = f'snapshots/{snapshot_name}/manifest.json'
+        backed_up = object_sizes(object_storage)
+        assert backed_up.keys() - snapshotted.keys() == {manifest_key}, \
+                f'The backup wrote more than the manifest: {sorted(backed_up.keys() - snapshotted.keys() - {manifest_key})}'
+        assert {key: size for key, size in backed_up.items() if key in snapshotted} == snapshotted, \
+                'The backup rewrote objects of the live table'
+
+        manifest = json.load(object_storage.get_resource().Bucket(object_storage.bucket_name).Object(manifest_key).get()['Body'])
+        assert manifest['sstables'], 'The manifest lists no sstable'
+        for sst in manifest['sstables']:
+            assert f"sstables/{sst['id']}/Data.db" in backed_up, f"The manifest points at nothing: {sst['id']}"
+            assert any(key.startswith(f"sstables/{sst['id']}/refs/snapshot-{snapshot_name}/") for key in backed_up), \
+                    f"No reference of the snapshot holds {sst['id']}"
+
+        backed_up_ids = {sst['id'] for sst in manifest['sstables']}
+        for s in servers:
+            rows = list(cql.execute(f"""SELECT sstable_id, state FROM system_distributed.snapshot_sstables
+                                        WHERE snapshot_name = '{snapshot_name}' AND "keyspace" = '{ks}'
+                                        AND "table" = '{cf}' AND datacenter = '{s.datacenter}' AND rack = '{s.rack}'"""))
+            assert rows, f'No sstable of the snapshot recorded in {s.datacenter}.{s.rack}'
+            for r in rows:
+                # 3 is snapshot_state::remote_and_local: the sstable is in the backup
+                # and, being the live data of the table, still in use. A backup keeps
+                # one replica of each tablet, so the rows it left out keep the state
+                # the snapshot gave them, 1 (local).
+                expected = 3 if str(r.sstable_id) in backed_up_ids else 1
+                assert r.state == expected, f'Unexpected state of {r.sstable_id}: {r.state}, expected {expected}'
+
+
+async def test_cluster_backup_of_object_storage_keyspace_rejects_a_copy(manager: ManagerClient, object_storage):
+    '''Everything but a backup in place would have to copy the objects of the table,
+    which is not implemented. Such a request has to fail rather than leave behind a
+    manifest pointing at objects which are not there.'''
+
+    topology = object_storage_backup_topology
+    servers, _ = await create_cluster(topology, manager, logger, object_storage)
+    cf = 'test'
+
+    async with new_test_keyspace(manager, keyspace_options(object_storage, rf=topology.rf)) as ks:
+        snapshot_name = await snapshot_object_storage_keyspace(manager, ks, cf, num_keys=10)
+
+        async def failed_backup(bucket, prefix, move_files=False):
+            tid = await manager.api.backup_cluster_snapshot_to_locations(servers[0].ip_addr, ks, snapshot_name, [{
+                'datacenter': servers[0].datacenter,
+                'endpoint': object_storage.address,
+                'bucket': bucket,
+                'prefix': prefix,
+            }], tables=[cf], move_files=move_files)
+            status = await manager.api.wait_task(servers[0].ip_addr, tid)
+            assert (status is not None) and (status['state'] == 'failed'), f'Backup did not fail: {status}'
+            return status['error']
+
+        for bucket, prefix in [(object_storage.bucket_name, 'another-prefix'), ('another-bucket', '')]:
+            assert 'copying them elsewhere is not implemented' in await failed_backup(bucket, prefix)
+
+        # Moving the objects into the backup would delete the data of the table.
+        assert 'they are the live data of the table' in await failed_backup(object_storage.bucket_name, '', move_files=True)
