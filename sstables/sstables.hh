@@ -141,6 +141,11 @@ constexpr const char* quarantine_dir = "quarantine";
 constexpr const char* pending_delete_dir = "pending_delete";
 constexpr const char* tempdir_extension = ".sstable";
 
+// The prefix an object storage keeps the sstables of a table under. A backup
+// writes to the same prefix, which is what lets a backup of a table already
+// living in the destination bucket share the objects that are there.
+constexpr const char* sstables_prefix = "sstables";
+
 constexpr auto table_subdirectories = std::to_array({
     staging_dir,
     upload_dir,

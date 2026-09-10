@@ -704,7 +704,7 @@ public:
         , _client(std::move(client))
         , _bucket(std::move(bucket))
         , _uses_foreign_location(loc.has_value())
-        , _prefix(loc ? std::move(*loc) : "sstables")
+        , _prefix(loc ? std::move(*loc) : sstables_prefix)
         , _as(as)
     {
         sstlog.debug("Object storage type={} keyspace={} table={} table_id={} bucket={} prefix={} uses_foreign_location={}", _type, _schema->ks_name(), _schema->cf_name(), _schema->id(), _bucket, _prefix, _uses_foreign_location);
