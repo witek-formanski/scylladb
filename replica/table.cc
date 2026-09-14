@@ -2223,6 +2223,11 @@ table::try_flush_memtable_to_sstable(compaction_group& cg, lw_shared_ptr<memtabl
 }
 
 void
+table::notify_dropped() noexcept {
+    _dropped.request_abort_ex(table_dropped_exception(_schema->ks_name(), _schema->cf_name()));
+}
+
+void
 table::start() {
     start_compaction();
     if (_schema->memtable_flush_period() > 0) {

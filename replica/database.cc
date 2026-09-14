@@ -1397,6 +1397,11 @@ void database::drop_table(sharded<database>& sharded_db,
     dblog.info("Dropping {}.{} {}snapshot", ks_name, cf_name, with_snapshot && auto_snapshot ? "with auto-" : "without ");
     auto& cf = *table_shards;
     sharded_db.local().remove(cf);
+    // Tell whoever pins the table that the drop is now inevitable. The table
+    // outlives this call, but there is no point in letting a long operation on
+    // it run to completion - cleanup_drop_table_on_all_shards() would only
+    // throw the result away.
+    cf.notify_dropped();
     table_shards.clear_views();
     cf.clear_views();
 }

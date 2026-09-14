@@ -433,6 +433,20 @@ struct table_stats {
 
 using storage_options = data_dictionary::storage_options;
 
+// Thrown by operations that were interrupted because the table they work on
+// got dropped. Derives from abort_requested_exception so that callers which
+// already distinguish an abort from a genuine failure keep doing so.
+class table_dropped_exception : public seastar::abort_requested_exception {
+    sstring _what;
+public:
+    table_dropped_exception(std::string_view ks_name, std::string_view cf_name)
+        : _what(seastar::format("table {}.{} was dropped", ks_name, cf_name))
+    { }
+    const char* what() const noexcept override {
+        return _what.c_str();
+    }
+};
+
 // Smart table pointer that guards the table object
 // while it's being accessed asynchronously
 class table_holder {
@@ -596,6 +610,10 @@ private:
     utils::phased_barrier _pending_streams_phaser;
     // Corresponding phaser for in-progress flushes
     utils::phased_barrier _pending_flushes_phaser;
+    // Fired when the table is dropped, before the drop waits on the phasers
+    // above. Long operations that hold the table alive watch it so that a DROP
+    // doesn't have to wait for them to run to completion.
+    abort_source _dropped;
 
     // This field cashes the last truncation time for the table.
     // The master resides in system.truncated table
@@ -1319,6 +1337,15 @@ public:
     size_t streams_in_progress() const {
         return _pending_streams_phaser.operations_in_progress();
     }
+
+    // Aborted once the table is removed from the database. Operations that keep
+    // the table alive (e.g. via stream_in_progress()) should subscribe to it, or
+    // poll it with check(), and give up as soon as it fires.
+    abort_source& dropped_abort_source() noexcept {
+        return _dropped;
+    }
+
+    void notify_dropped() noexcept;
 
     future<> await_pending_flushes() noexcept {
         return _pending_flushes_phaser.advance_and_await();
