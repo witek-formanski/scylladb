@@ -108,7 +108,10 @@ static std::string format_snapshot_location(std::string_view prefix, std::string
 }
 
 std::string db::snapshot::sstables_location(std::string_view prefix, const replica::table& t, std::string_view snapshot_name) {
-    return format_snapshot_location(prefix, "sstables", t);
+    // The same prefix a native object-storage table stores its sstables under,
+    // which is what lets a backup of such a table point at the objects that
+    // already are in the bucket.
+    return format_snapshot_location(prefix, sstables::object_storage_default_prefix, t);
 }
 
 std::string db::snapshot::snapshot_meta_location(std::string_view prefix, const replica::table& t, std::string_view snapshot_name) {
@@ -425,8 +428,25 @@ db::snapshot::backup_sstables(db::snapshot_ctl& snap, table_id table_id, std::st
 
     auto global_table = co_await get_table_on_all_shards(snap.db(), ksname, cfname);
     auto& storage_options = global_table->get_storage_options();
-    if (!storage_options.is_local_type()) {
-        throw std::invalid_argument("not able to backup a non-local table");
+    if (auto* os = std::get_if<data_dictionary::storage_options::object_storage>(&storage_options.value)) {
+        auto table_prefix = sstables::object_storage_prefix(*os);
+        // The sstables of such a table already are in the destination, under
+        // the very prefix a backup uploads to, and the references of the
+        // snapshot hold them there for as long as it lives. There is nothing
+        // left to do but record the snapshot as backed up.
+        if (os->endpoint != endpoint || os->bucket != bucket || table_prefix != prefix) {
+            throw std::invalid_argument(fmt::format("cannot back up {}.{} to {}:{}/{}: the table keeps its sstables in {}:{}/{}, and copying them elsewhere is not implemented",
+                    ksname, cfname, endpoint, bucket, prefix, os->endpoint, os->bucket, table_prefix));
+        }
+        if (use_move) {
+            throw std::invalid_argument(fmt::format("cannot move the sstables of {}.{} into a backup: they are the live data of the table", ksname, cfname));
+        }
+        snap_log.info("Promoting {} sstables of snapshot {} of {}.{} to a backup in {}:{}/{}", sstables.size(), tag, ksname, cfname, endpoint, bucket, prefix);
+        for (auto& sst : sstables) {
+            sst.state = db::snapshot_state::remote_and_local;
+        }
+        co_await sth.insert_snapshot_sstables(tag, ksname, cfname, local.dc, local.rack, sstables);
+        co_return;
     }
     auto& local_storage_options = std::get<data_dictionary::storage_options::local>(storage_options.value);
     auto dir = (local_storage_options.dir / sstables::snapshots_dir / std::string_view(tag));
