@@ -153,6 +153,10 @@ protected:
     netw::messaging_service& _ms;
     replica::database& _db;
     replica::table& _table;
+    // Fired when the table is dropped. Streaming into a table that is going
+    // away is pointless, and the drop waits for us, so give up as soon as we
+    // notice it.
+    abort_source& _dropped;
     locator::effective_replication_map_ptr _erm;
     std::vector<sstables::shared_sstable> _sstables;
     const primary_replica_only _primary_replica_only;
@@ -164,6 +168,7 @@ public:
             : _ms(ms)
             , _db(db)
             , _table(db.find_column_family(table_id))
+            , _dropped(_table.dropped_abort_source())
             , _erm(std::move(erm))
             , _sstables(std::move(sstables))
             , _primary_replica_only(primary)
@@ -263,6 +268,7 @@ private:
     future<sst_classification_info> download_fully_contained_sstables(std::vector<sstables::shared_sstable> sstables) const {
         sst_classification_info downloaded_sstables(this_smp_shard_count());
         for (const auto& sstable : sstables) {
+            _dropped.check();
             // For now, tablet-aware restore doesn't need to mutate sstable level to 0
             // since we support only restoring to empty tables and so we can keep the sstable levels on backup.
             // Once we support restoring onto live tables we may want to mutate the ingested sstables' level to 0.
@@ -455,6 +461,7 @@ future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
                    }) | std::ranges::to<std::vector>());
 
     for (auto& [tablet_range, sstables_fully_contained, sstables_partially_contained] : classified_sstables) {
+        _dropped.check();
         auto per_tablet_progress = make_shared<per_tablet_stream_progress>(
             progress,
             sstables_fully_contained.size() + sstables_partially_contained.size());
@@ -477,8 +484,10 @@ future<> sstable_streamer::stream_sstables(const dht::partition_range& pr, std::
     size_t nr_sst_current = 0;
 
     while (!sstables.empty()) {
+        _dropped.check();
+
         co_await utils::get_local_injector().inject("load_and_stream_before_streaming_batch",
-            utils::wait_for_message(60s));
+            utils::wait_for_message(60s, &_dropped));
 
         const size_t batch_sst_nr = std::min(16uz, sstables.size());
         auto sst_processed = sstables
@@ -524,6 +533,7 @@ future<> sstable_streamer::stream_sstable_mutations(streaming::plan_id ops_uuid,
 
     try {
         while (auto mf = co_await reader()) {
+            _dropped.check();
             bool is_partition_start = mf->is_partition_start();
             if (is_partition_start) {
                 ++num_partitions_processed;
@@ -653,6 +663,8 @@ future<> sstables_loader::load_and_stream(sstring ks_name, sstring cf_name,
     // _pending_streams_phaser.close() which blocks until all outstanding
     // stream_in_progress() guards are released, so holding this guard
     // keeps the table alive for the entire streaming operation.
+    // A concurrent DROP fires the table's dropped abort source, which the
+    // streamer honours, so the drop only waits for the stream to unwind.
     // find_column_family throws no_such_column_family if the table was
     // already dropped before we got here.
     auto& tbl = _db.local().find_column_family(table_id);
